@@ -6,7 +6,7 @@ const app = new Elysia()
   .use(corePlugin)
   .use(emailsRoute)
   .use(propertiesRoute)
-  .listen({ hostname: '::', port: 5002 }, server => {
+  .listen({ hostname: '::', port: 5003 }, server => {
     console.debug(`Server is running at ${server.hostname}:${server.port}`)
   })
 

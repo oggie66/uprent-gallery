@@ -1,6 +1,6 @@
 {
-  "name": "uprent",
-  "version": "1.86.0",
+  "name": "uprent-gallery",
+  "version": "0.1.0",
   "devDependencies": {
     "lightningcss": "1.30.1",
     "prettier": "latest",
@@ -10,16 +10,19 @@
     "typescript": "5.4.5"
   },
   "engines": {
-    "node": ">=18"
+    "node": "^20.19.0 || >=22.12.0"
   },
   "packageManager": "bun@1.2.16",
   "private": true,
   "scripts": {
     "format": "bun -b run prettier --log-level 'warn' --write '**/*.{ts,tsx,scss,html,svelte}'",
-    "lint:all": "bun install && bun -b run turbo run lint --continue && bun -b run prettier --check '**/*.{ts,svelte,scss}'"
+    "lint:all": "bun -b run turbo run lint --continue && bun -b run prettier --check '**/*.{ts,svelte,scss}'",
+    "test": "bun test"
   },
   "workspaces": [
     "apps/*",
     "packages/*"
-  ]
+  ],
+  "author": "Ognjen Karagunovic",
+  "description": "A personal rental-property gallery and email viewer."
 }

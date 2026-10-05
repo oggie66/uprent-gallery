@@ -1,90 +1,144 @@
 import Imap from 'imap'
-import { simpleParser, type ParsedMail, type AddressObject } from 'mailparser'
+import { createHash } from 'node:crypto'
+import type { ParsedMail, AddressObject } from 'mailparser'
 import {
   type Email,
   type EmailAttachment,
   EMAIL_CATEGORY,
 } from '~core/database'
-import { catchError } from '~utils'
+import { fetchMessages } from './email/fetch-messages'
+import {
+  parseSelectiveMessage,
+  planMessage,
+  sectionsFor,
+  type MimeStructure,
+} from './email/mime'
 
 export class EmailServer {
-  private connectionPool: Record<string, Imap> = {}
-  private connectionTimeouts: Record<string, ReturnType<typeof setTimeout>> = {}
+  private readonly pending = new Map<string, Promise<Email[]>>()
 
-  async loadEmails(username: string, password: string): Promise<Email[]> {
-    const imap = await this.connect(username, password)
-    await this.openBox(imap, 'INBOX')
+  loadEmails(username: string, password: string): Promise<Email[]> {
+    // Coalesce concurrent loads without sharing a mutable selected mailbox.
+    const key = createHash('sha256')
+      .update(JSON.stringify([username, password]))
+      .digest('hex')
+    const existing = this.pending.get(key)
+    if (existing) return existing
+    const request = this.loadMailbox(username, password).finally(() =>
+      this.pending.delete(key),
+    )
+    this.pending.set(key, request)
+    return request
+  }
 
-    try {
-      const uids = await this.search(imap, ['ALL'])
-
-      if (!uids.length) {
-        return []
+  private async loadMailbox(
+    username: string,
+    password: string,
+  ): Promise<Email[]> {
+    const connection = new Imap({
+      user: username,
+      password,
+      host: '172.233.33.104',
+      port: 993,
+      tls: true,
+      authTimeout: 10_000,
+      connTimeout: 10_000,
+    })
+    let timeout: ReturnType<typeof setTimeout> | undefined
+    let finished = false
+    const interrupted = new Promise<never>((_resolve, reject) => {
+      connection.on('error', reject)
+      connection.once('end', () => {
+        if (!finished)
+          reject(
+            new Error('The mail connection closed before loading finished.'),
+          )
+      })
+      timeout = setTimeout(
+        () =>
+          reject(new Error('Loading the mailbox timed out. Please try again.')),
+        30_000,
+      )
+    })
+    const read = async () => {
+      await new Promise<void>(resolve => {
+        connection.once('ready', resolve)
+        connection.connect()
+      })
+      await new Promise<void>((resolve, reject) => {
+        connection.openBox('INBOX', true, error =>
+          error ? reject(error) : resolve(),
+        )
+      })
+      const uids = await new Promise<number[]>((resolve, reject) => {
+        connection.search(['ALL'], (error, values) =>
+          error ? reject(error) : resolve(values),
+        )
+      })
+      const emails: Email[] = []
+      for (let offset = 0; offset < uids.length; offset += 100) {
+        emails.push(
+          ...(await this.fetchBatch(
+            connection,
+            uids.slice(offset, offset + 100),
+          )),
+        )
       }
-
-      const emails = await this.fetchAndParseEmails(imap, uids)
-
       return emails.sort(
         (a, b) =>
           new Date(b.datetime).getTime() - new Date(a.datetime).getTime(),
       )
+    }
+    try {
+      return await Promise.race([read(), interrupted])
     } finally {
-      await catchError(this.closeBox(imap), false)
+      finished = true
+      clearTimeout(timeout)
+      connection.destroy()
     }
   }
 
-  private async fetchAndParseEmails(
-    imap: Imap,
-    uids: number[],
-  ): Promise<Email[]> {
-    return new Promise<Email[]>((resolve, reject) => {
-      const fetch = imap.fetch(uids, {
-        bodies: '',
-        struct: false,
-      })
-
-      const emailPromises: Promise<Email | null>[] = []
-
-      fetch.on('message', msg => {
-        const promise = new Promise<Email | null>(resolveEmail => {
-          let uid = 0
-          let flags: string[] = []
-          const chunks: Buffer[] = []
-
-          msg.once('attributes', attrs => {
-            uid = attrs.uid
-            flags = attrs.flags || []
-          })
-
-          msg.on('body', stream => {
-            stream.on('data', chunk => chunks.push(chunk))
-          })
-
-          msg.once('end', async () => {
-            try {
-              const fullSource = Buffer.concat(chunks)
-              const parsed = await simpleParser(fullSource)
-              const email = this.mapParsedToEmail(uid, flags, parsed)
-              resolveEmail(email)
-            } catch (err) {
-              console.error(`Failed to parse email UID ${uid}`, err)
-              resolveEmail(null)
-            }
-          })
-        })
-
-        emailPromises.push(promise)
-      })
-
-      fetch.once('error', err => {
-        reject(err)
-      })
-
-      fetch.once('end', async () => {
-        const results = await Promise.all(emailPromises)
-        resolve(results.filter((e): e is Email => e !== null))
-      })
+  private async fetchBatch(connection: Imap, uids: number[]): Promise<Email[]> {
+    const summaries = await fetchMessages(connection, uids, {
+      bodies: 'HEADER',
+      struct: true,
     })
+    // Messages with identical MIME layouts share one FETCH command.
+    const groups = new Map<string, typeof summaries>()
+    for (const message of summaries) {
+      const structure = message.attributes.struct as MimeStructure | undefined
+      if (!structure)
+        throw new Error('The mail server did not return MIME structure.')
+      const key = JSON.stringify(sectionsFor(planMessage(structure)))
+      groups.set(key, [...(groups.get(key) || []), message])
+    }
+    const emails: Email[] = []
+    for (const [key, group] of groups) {
+      const bodies = await fetchMessages(
+        connection,
+        group.map(message => message.attributes.uid),
+        { bodies: JSON.parse(key) as string[] },
+      )
+      const byUid = new Map(
+        bodies.map(message => [message.attributes.uid, message]),
+      )
+      for (const message of group) {
+        const { uid, flags, struct } = message.attributes
+        const fetched = byUid.get(uid)
+        // A message may be removed between SEARCH and FETCH.
+        if (!fetched) continue
+        const headers = message.bodies.get('HEADER')
+        if (!headers)
+          throw new Error('The mail server did not return message headers.')
+        const parsed = await parseSelectiveMessage(
+          headers,
+          struct as MimeStructure,
+          fetched.bodies,
+        )
+        emails.push(this.mapParsedToEmail(uid, flags || [], parsed))
+      }
+    }
+    return emails
   }
 
   private mapParsedToEmail(
@@ -153,73 +207,6 @@ export class EmailServer {
       attachments,
       content: parsed.html || parsed.textAsHtml || parsed.text || '',
     }
-  }
-
-  private async connect(username: string, password: string): Promise<Imap> {
-    if (this.connectionPool[username]) {
-      this.resetInactivityTimeout(username)
-      return this.connectionPool[username]
-    }
-
-    const imap = await this.createImap(username, password)
-    this.connectionPool[username] = imap
-    return imap
-  }
-
-  private createImap(username: string, password: string): Promise<Imap> {
-    return new Promise<Imap>((resolve, reject) => {
-      const imap = new Imap({
-        user: username,
-        password,
-        host: '172.233.33.104',
-        port: 993,
-        tls: true,
-        authTimeout: 10000,
-        connTimeout: 10000,
-      })
-      imap.once('ready', () => resolve(imap))
-      imap.once('error', reject)
-      imap.connect()
-    })
-  }
-
-  private resetInactivityTimeout(username: string) {
-    if (this.connectionTimeouts[username]) {
-      clearTimeout(this.connectionTimeouts[username])
-    }
-
-    this.connectionTimeouts[username] = setTimeout(
-      () => {
-        const imap = this.connectionPool[username]
-        if (imap) {
-          catchError(imap.end(), false)
-        }
-        delete this.connectionPool[username]
-        delete this.connectionTimeouts[username]
-      },
-      60 * 60 * 1000,
-    )
-  }
-
-  private openBox(connection: Imap, boxName: string): Promise<void> {
-    return new Promise(resolve => {
-      connection.openBox(boxName, false, () => resolve())
-    })
-  }
-
-  private closeBox(connection: Imap): Promise<void> {
-    return new Promise(resolve => {
-      connection.closeBox(false, () => resolve())
-    })
-  }
-
-  private search(connection: Imap, criteria: string[]): Promise<number[]> {
-    return new Promise((resolve, reject) => {
-      connection.search(criteria, (err, uids) => {
-        if (err) return reject(err)
-        resolve(uids)
-      })
-    })
   }
 }
 
